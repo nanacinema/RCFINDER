@@ -1,5 +1,8 @@
 # bot.py
 import os
+import telegram
+logger.info("python-telegram-bot version: %s", getattr(telegram, '__version__', 'unknown'))
+
 import logging
 import sqlite3
 import time
