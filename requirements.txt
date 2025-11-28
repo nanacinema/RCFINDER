@@ -1,4 +1,4 @@
 python-telegram-bot==20.7
 python-dotenv==1.0.0
 requests==2.32.3
-# Optional: add flask==2.3.2 only if you enabled FLASK_ENABLE=true
+
