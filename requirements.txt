@@ -1,4 +1,5 @@
-python-telegram-bot==20.7
+python-telegram-bot==20.3
 python-dotenv==1.0.0
 requests==2.32.3
-
+# If you later enable Flask health endpoint, add:
+# flask==2.3.2
