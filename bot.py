@@ -1,22 +1,23 @@
-# bot.py
-import os
-import telegram
-logger.info("python-telegram-bot version: %s", getattr(telegram, '__version__', 'unknown'))
+#!/usr/bin/env python3
+"""
+Fresh bot.py — async, PTB v20+, SQLite, admin + credits, inline buttons.
 
+Usage:
+- Set BOT_TOKEN in Railway / env
+- (Optional) Set ADMIN_IDS as comma-separated Telegram user IDs
+- Deploy to Railway with requirements pinned to a PTB 20.x release.
+"""
+
+import os
 import logging
 import sqlite3
 import time
-import threading
 import traceback
 from typing import Optional, Set, Tuple
 
 import requests
 from dotenv import load_dotenv
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -26,38 +27,32 @@ from telegram.ext import (
     filters,
 )
 
-# Optional: only import Flask if health endpoint is enabled
-FLASK_ENABLED = os.getenv("FLASK_ENABLE", "false").lower() in ("1", "true", "yes")
-if FLASK_ENABLED:
-    try:
-        from flask import Flask
-    except Exception:
-        Flask = None
-
 # -------------------------
 # Load environment
 # -------------------------
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-RAW_ADMIN_IDS = os.getenv("ADMIN_IDS", "")  # comma separated
+RAW_ADMIN_IDS = os.getenv("ADMIN_IDS", "")  # comma separated (e.g. "123,456")
 DB_PATH = os.getenv("DB_PATH", "data/bot.db")
 API_BASE = os.getenv("API_BASE", "https://earnindia.top/my.php?vehicle=")
-LOOKUP_COOLDOWN = float(os.getenv("LOOKUP_COOLDOWN", "2"))
-FLASK_PORT = int(os.getenv("PORT", "8080"))  # used only if Flask enabled
+LOOKUP_COOLDOWN = float(os.getenv("LOOKUP_COOLDOWN", "2"))  # seconds between lookups per user
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is required in environment variables.")
+    raise RuntimeError("BOT_TOKEN is required in environment variables (Railway → Service → Variables).")
 
+# -------------------------
+# Helpers: admins, parse
+# -------------------------
 def parse_admins(raw: str) -> Set[int]:
-    out = set()
+    out: Set[int] = set()
     for part in raw.split(","):
         p = part.strip()
         if not p:
             continue
         try:
             out.add(int(p))
-        except ValueError:
+        except Exception:
             # ignore invalid entries
             continue
     return out
@@ -68,15 +63,22 @@ ADMIN_IDS = parse_admins(RAW_ADMIN_IDS)
 # Logging
 # -------------------------
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 )
 logger = logging.getLogger("vehicle-bot")
+
+# show installed PTB version (helps debug compatibility)
+try:
+    import telegram
+    logger.info("python-telegram-bot version: %s", getattr(telegram, "__version__", "unknown"))
+except Exception:
+    logger.info("python-telegram-bot import failed for version logging")
 
 # -------------------------
 # Rate limiting (in-memory)
 # -------------------------
-_last_lookup_ts = {}  # user_id -> timestamp (float)
+_last_lookup_ts: dict[int, float] = {}
 
 def can_lookup(user_id: int) -> Tuple[bool, Optional[int]]:
     now = time.time()
@@ -91,7 +93,7 @@ def mark_lookup(user_id: int):
     _last_lookup_ts[user_id] = time.time()
 
 # -------------------------
-# Database (SQLite, simple)
+# Database (SQLite)
 # -------------------------
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
@@ -107,7 +109,7 @@ def init_db():
             credits INTEGER DEFAULT 0,
             blocked INTEGER DEFAULT 0,
             access TEXT DEFAULT 'user'
-        );
+        )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS logs (
@@ -117,7 +119,7 @@ def init_db():
             success INTEGER,
             error TEXT,
             ts DATETIME DEFAULT CURRENT_TIMESTAMP
-        );
+        )
     """)
     conn.commit()
     conn.close()
@@ -129,16 +131,15 @@ def ensure_user(user_id: int):
     conn.commit()
     conn.close()
 
-def get_user_info(user_id: int):
+def get_user_info(user_id: int) -> Tuple[int, bool, str]:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT credits, blocked, access FROM users WHERE user_id=?", (user_id,))
     row = cur.fetchone()
     conn.close()
     if row:
-        return int(row[0]), bool(row[1]), row[2]
-    else:
-        return 0, False, "user"
+        return int(row[0]), bool(row[1]), str(row[2])
+    return 0, False, "user"
 
 def add_credits(user_id: int, amount: int):
     conn = get_conn()
@@ -180,19 +181,15 @@ def log_search(user_id: int, vehicle: str, success: bool, error: str = ""):
 # -------------------------
 # Fetcher
 # -------------------------
-def fetch_vehicle(number: str) -> str:
-    url = f"{API_BASE}{number}"
+def fetch_vehicle(vehicle_no: str) -> str:
+    url = f"{API_BASE}{vehicle_no}"
     try:
         r = requests.get(url, timeout=10)
         r.raise_for_status()
-        # Try JSON, otherwise return text
         ct = r.headers.get("content-type", "")
         if "application/json" in ct:
             try:
-                j = r.json()
-                # pretty format JSON into lines
-                import json
-                return json.dumps(j, indent=2, ensure_ascii=False)
+                return r.json() if isinstance(r.json(), dict) else r.text
             except Exception:
                 return r.text
         return r.text
@@ -201,18 +198,24 @@ def fetch_vehicle(number: str) -> str:
         return f"❌ Error fetching vehicle data: {e}"
 
 # -------------------------
-# Message formatting (simple)
+# Format output
 # -------------------------
-def format_vehicle_msg(vehicle: str, data_text: str, reveal_mobile: bool):
-    # The API returns either JSON or plain text. We'll present the raw but nicely labeled.
+def format_vehicle_msg(vehicle: str, raw: str, reveal_mobile: bool) -> str:
+    # If raw is dict-like, convert to pretty text
+    if isinstance(raw, dict):
+        import json
+        raw_text = json.dumps(raw, indent=2, ensure_ascii=False)
+    else:
+        raw_text = str(raw)
     mobile_note = "" if reveal_mobile else "\n🔒 Mobile: Available for premium users"
-    return (
+    msg = (
         f"🚗 *Vehicle Information*\n"
         f"➤ *Vehicle Number:* {vehicle}\n\n"
-        f"🔎 *Raw Data:*\n"
-        f"```\n{data_text}\n```\n"
+        f"🔎 *Raw data:*\n"
+        f"```\n{raw_text}\n```\n"
         f"{mobile_note}"
     )
+    return msg
 
 # -------------------------
 # Handlers
@@ -220,72 +223,84 @@ def format_vehicle_msg(vehicle: str, data_text: str, reveal_mobile: bool):
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id)
+    # mark admin access in DB (non-destructive)
     if user.id in ADMIN_IDS:
-        # ensure admin is marked as admin access
         conn = get_conn()
         cur = conn.cursor()
         cur.execute("UPDATE users SET access='admin' WHERE user_id=?", (user.id,))
         conn.commit()
         conn.close()
 
-    keyboard = [
+    kb = [
         [InlineKeyboardButton("🔍 Search Vehicle", callback_data="search")],
         [InlineKeyboardButton("💰 Buy Credits", callback_data="buy")],
         [InlineKeyboardButton("💳 My Credits", callback_data="credits")],
     ]
     if user.id in ADMIN_IDS:
-        keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin")])
+        kb.append([InlineKeyboardButton("⚙️ Admin", callback_data="admin")])
 
     await update.message.reply_text(
-        "👋 Welcome! Use the buttons below or /search <VEHICLE_NO>.\nExample: /search KL70C1679",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        "👋 Welcome! Use the menu below or send `/search <VEHICLE_NO>`.\nExample: `/search KL70C1679`",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
     )
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    user_id = q.from_user.id
     await q.answer()
-    if q.data == "search":
-        await q.edit_message_text("Send vehicle number (example: KL70C1679) — one message only.")
-        context.user_data["await_vehicle"] = True
-    elif q.data == "buy":
-        text = "To buy credits, contact the admin. Admins:\n"
-        for aid in ADMIN_IDS:
-            text += f"- {aid}\n"
-        await q.edit_message_text(text)
-    elif q.data == "credits":
-        credits, blocked, access = get_user_info(user_id)
-        await q.edit_message_text(f"💳 You have *{credits}* credits.\nAccess: {access}", parse_mode="Markdown")
-    elif q.data == "admin" and user_id in ADMIN_IDS:
-        kb = [
-            [InlineKeyboardButton("➕ Add Credits (use /addcredits)", callback_data="noop")],
-            [InlineKeyboardButton("🚫 Block User (use /block)", callback_data="noop")],
-            [InlineKeyboardButton("📢 Broadcast (use /broadcast)", callback_data="noop")],
-        ]
-        await q.edit_message_text("Admin Panel - use commands below:", reply_markup=InlineKeyboardMarkup(kb))
+    uid = q.from_user.id
 
+    if q.data == "search":
+        await q.edit_message_text("Send vehicle number (example: KL70C1679).")
+        context.user_data["await_vehicle"] = True
+        return
+
+    if q.data == "buy":
+        text = "💳 To buy credits contact admin:\n"
+        if ADMIN_IDS:
+            for aid in ADMIN_IDS:
+                text += f"- {aid}\n"
+        else:
+            text += "No admin configured. Add ADMIN_IDS in Railway variables."
+        await q.edit_message_text(text)
+        return
+
+    if q.data == "credits":
+        credits, blocked, access = get_user_info(uid)
+        await q.edit_message_text(f"💳 Credits: *{credits}*\nAccess: {access}", parse_mode="Markdown")
+        return
+
+    if q.data == "admin" and uid in ADMIN_IDS:
+        kb = [
+            [InlineKeyboardButton("➕ Add Credits (/addcredits)", callback_data="noop")],
+            [InlineKeyboardButton("🚫 Block User (/block)", callback_data="noop")],
+            [InlineKeyboardButton("📣 Broadcast (/broadcast)", callback_data="noop")],
+        ]
+        await q.edit_message_text("Admin Panel — use commands below", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+# text message handler (used for vehicle after pressing search or plain text)
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
-    # check if our flow expects a vehicle number
+    # If waiting for vehicle input
     if context.user_data.get("await_vehicle"):
         context.user_data["await_vehicle"] = False
         vehicle = text.replace(" ", "").upper()
         allowed, wait = can_lookup(user_id)
         if not allowed:
-            await update.message.reply_text(f"⏳ Please wait {wait}s before next lookup.")
+            await update.message.reply_text(f"⏳ Wait {wait}s before next search.")
             return
         credits, blocked, access = get_user_info(user_id)
         if blocked:
-            await update.message.reply_text("⛔ You are blocked from using this bot.")
+            await update.message.reply_text("⛔ You are blocked.")
             return
         if credits <= 0 and user_id not in ADMIN_IDS and access != "premium":
-            await update.message.reply_text("❌ No credits. Contact admin to buy credits.")
+            await update.message.reply_text("❌ No credits. Contact admin.")
             return
-        # fetch
+
         await update.message.reply_text("⏳ Fetching vehicle data...")
-        data = fetch_vehicle(vehicle)
-        # deduct credit if needed
+        raw = fetch_vehicle(vehicle)
         if user_id not in ADMIN_IDS and access != "premium":
             if not deduct_credit(user_id):
                 await update.message.reply_text("❌ Failed to deduct credit. Contact admin.")
@@ -293,13 +308,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mark_lookup(user_id)
         log_search(user_id, vehicle, True)
         reveal_mobile = user_id in ADMIN_IDS or access == "premium"
-        msg = format_vehicle_msg(vehicle, data, reveal_mobile)
+        msg = format_vehicle_msg(vehicle, raw, reveal_mobile)
         await update.message.reply_text(msg, parse_mode="Markdown")
         return
 
-    # plain text flows (commands handled separately)
-    await update.message.reply_text("Send /start to open the menu or /search <VEHICLE_NO>")
+    # default response
+    await update.message.reply_text("Send /start to open menu or /search <VEHICLE_NO>")
 
+# /search command
 async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not context.args:
@@ -308,7 +324,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vehicle = context.args[0].replace(" ", "").upper()
     allowed, wait = can_lookup(user_id)
     if not allowed:
-        await update.message.reply_text(f"⏳ Please wait {wait}s before next lookup.")
+        await update.message.reply_text(f"⏳ Wait {wait}s before next search.")
         return
     credits, blocked, access = get_user_info(user_id)
     if blocked:
@@ -317,8 +333,9 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if credits <= 0 and user_id not in ADMIN_IDS and access != "premium":
         await update.message.reply_text("❌ No credits. Contact admin.")
         return
+
     await update.message.reply_text("⏳ Fetching vehicle data...")
-    data = fetch_vehicle(vehicle)
+    raw = fetch_vehicle(vehicle)
     if user_id not in ADMIN_IDS and access != "premium":
         if not deduct_credit(user_id):
             await update.message.reply_text("❌ Failed to deduct a credit.")
@@ -326,7 +343,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mark_lookup(user_id)
     log_search(user_id, vehicle, True)
     reveal_mobile = user_id in ADMIN_IDS or access == "premium"
-    msg = format_vehicle_msg(vehicle, data, reveal_mobile)
+    msg = format_vehicle_msg(vehicle, raw, reveal_mobile)
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 # -------------------------
@@ -340,7 +357,7 @@ async def addcredits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = int(context.args[0])
         amt = int(context.args[1])
         add_credits(uid, amt)
-        await update.message.reply_text(f"Added {amt} credits to {uid}")
+        await update.message.reply_text(f"✅ Added {amt} credits to {uid}")
     except Exception:
         await update.message.reply_text("Usage: /addcredits <user_id> <amount>")
 
@@ -350,17 +367,17 @@ async def block_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         uid = int(context.args[0])
         set_block(uid, True)
-        await update.message.reply_text(f"User {uid} blocked.")
+        await update.message.reply_text(f"🚫 User {uid} blocked.")
     except Exception:
         await update.message.reply_text("Usage: /block <user_id>")
 
-async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def unblock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     try:
         uid = int(context.args[0])
         set_block(uid, False)
-        await update.message.reply_text(f"User {uid} unblocked.")
+        await update.message.reply_text(f"✔ User {uid} unblocked.")
     except Exception:
         await update.message.reply_text("Usage: /unblock <user_id>")
 
@@ -404,36 +421,22 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 # -------------------------
-# Optional Flask health endpoint
-# -------------------------
-flask_thread = None
-if FLASK_ENABLED and Flask:
-    flask_app = Flask("health_app")
-
-    @flask_app.route("/health")
-    def _health():
-        return "OK", 200
-
-    def run_flask():
-        flask_app.run(host="0.0.0.0", port=FLASK_PORT)
-
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-
-# -------------------------
 # Main
 # -------------------------
 async def main():
     init_db()
-    # ensure ADMIN_IDS in db
+    # ensure admins exist in db
     for aid in ADMIN_IDS:
         ensure_user(aid)
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # commands & handlers
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("search", search_cmd))
     app.add_handler(CommandHandler("addcredits", addcredits_cmd))
     app.add_handler(CommandHandler("block", block_cmd))
-    app.add_handler(CommandHandler("unblock", unban_cmd))
+    app.add_handler(CommandHandler("unblock", unblock_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
 
@@ -441,14 +444,14 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
     app.add_error_handler(error_handler)
 
-    # start optional flask
-    if flask_thread:
-        flask_thread.start()
-        logger.info("Flask health endpoint started.")
-
     logger.info("Starting bot polling...")
     await app.run_polling()
 
 if __name__ == "__main__":
     import asyncio
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by KeyboardInterrupt")
+    except Exception:
+        logger.exception("Fatal error in main")
